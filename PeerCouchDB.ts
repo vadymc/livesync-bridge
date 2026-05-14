@@ -1,5 +1,5 @@
 import { DirectFileManipulator, FileInfo, MetaEntry, ReadyEntry } from "./lib/src/API/DirectFileManipulatorV2.ts";
-import { FilePathWithPrefix, LOG_LEVEL_NOTICE, MILESTONE_DOCID, TweakValues } from "./lib/src/common/types.ts";
+import { DocumentID, FilePathWithPrefix, LOG_LEVEL_NOTICE, MILESTONE_DOCID, TweakValues } from "./lib/src/common/types.ts";
 import { PeerCouchDBConf, FileData } from "./types.ts";
 import { decodeBinary } from "./lib/src/string_and_binary/convert.ts";
 import { isPlainText } from "./lib/src/string_and_binary/path.ts";
@@ -11,6 +11,11 @@ import { createBinaryBlob, createTextBlob, isDocContentSame, unique } from "./li
 export class PeerCouchDB extends Peer {
     man: DirectFileManipulator;
     declare config: PeerCouchDBConf;
+    private _sinceSaveInterval?: ReturnType<typeof setInterval>;
+    private _healthCheckInterval?: ReturnType<typeof setInterval>;
+    private _lastChangeReceivedAt = Date.now();
+    private static readonly HEALTH_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+    private static readonly STALE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes with no changes
     constructor(conf: PeerCouchDBConf, dispatcher: DispatchFun) {
         super(conf, dispatcher);
         this.man = new DirectFileManipulator(conf);
@@ -102,7 +107,30 @@ export class PeerCouchDB extends Peer {
             deleted: ret.deleted
         };
     }
+    private async _startWithRetry(attempt: number = 0): Promise<void> {
+        const MAX_RETRIES = 10;
+        const BASE_DELAY_MS = 1000;
+        const MAX_DELAY_MS = 300000; // 5 minutes
+
+        try {
+            await this._startInner();
+        } catch (ex) {
+            if (attempt >= MAX_RETRIES) {
+                this.normalLog(`Start failed after ${MAX_RETRIES} retries, giving up: ${ex}`, LOG_LEVEL_NOTICE);
+                throw ex;
+            }
+            const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), MAX_DELAY_MS);
+            this.normalLog(`Start failed (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms: ${ex}`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return this._startWithRetry(attempt + 1);
+        }
+    }
+
     async start(): Promise<void> {
+        return this._startWithRetry();
+    }
+
+    private async _startInner(): Promise<void> {
         const baseDir = this.toLocalPath("");
         await this.man.ready.promise;
         const w = await this.man.rawGet<Record<string, any>>(MILESTONE_DOCID);
@@ -162,7 +190,52 @@ export class PeerCouchDB extends Peer {
         } else {
             this.normalLog(`Watch starting from ${this.man.since}`);
         }
+
+        // Force backfill requested via --backfill flag: start from the beginning
+        if (this.getSetting("force-backfill") === "true") {
+            this.man.since = "0";
+            this.setSetting("force-backfill", ""); // Clear flag
+            this.normalLog(`Force backfill requested, starting from beginning`);
+        }
+
+        // If we have a saved since pointer, backfill any missed changes before starting live watch
+        if (this.man.since && this.man.since !== "now") {
+            this.normalLog(`Backfill: catching up from seq ${this.man.since}...`);
+            try {
+                const lastSeq = await this.man.followUpdates(
+                    async (entry) => {
+                        if (!entry.path) return;
+                        const d = entry.type == "plain" ? entry.data : new Uint8Array(decodeBinary(entry.data));
+                        let path = entry.path.substring(baseDir.length);
+                        if (path.startsWith("/")) {
+                            path = path.substring(1);
+                        }
+                        if (entry.deleted || entry._deleted) {
+                            this.sendLog(`[backfill] ${path} delete detected`);
+                            await this.dispatchDeleted(path);
+                        } else {
+                            const docData = { ctime: entry.ctime, mtime: entry.mtime, size: entry.size, deleted: entry.deleted || entry._deleted, data: d };
+                            this.sendLog(`[backfill] ${path} change detected`);
+                            await this.dispatch(path, docData);
+                        }
+                    },
+                    (doc) => {
+                        if (!doc.path) return false;
+                        if (doc.path.indexOf(":") !== -1) return false;
+                        return doc.path.startsWith(baseDir);
+                    }
+                );
+                this.setSetting("since", lastSeq?.toString() ?? this.man.since);
+                this.man.since = lastSeq?.toString() ?? this.man.since;
+                this.normalLog(`Backfill: caught up to seq ${this.man.since}`);
+            } catch (ex) {
+                this.normalLog(`Backfill failed, will start live watch anyway: ${ex}`, LOG_LEVEL_NOTICE);
+                // Continue to live watch — don't block startup on backfill failure
+            }
+        }
+
         this.man.beginWatch(async (entry) => {
+            this._lastChangeReceivedAt = Date.now();
             if (!entry.path) return;
             const d = entry.type == "plain" ? entry.data : new Uint8Array(decodeBinary(entry.data));
             let path = entry.path.substring(baseDir.length);
@@ -183,6 +256,36 @@ export class PeerCouchDB extends Peer {
             if (entry.path.indexOf(":") !== -1) return false;
             return entry.path.startsWith(baseDir);
         });
+
+        // Periodic since pointer save — every 30 seconds to limit data loss on crash
+        this._sinceSaveInterval = setInterval(() => {
+            const currentSince = this.man.since;
+            if (currentSince) {
+                this.setSetting("since", currentSince);
+            }
+        }, 30000);
+
+        // Health check: verify CouchDB connectivity if no changes received for a while
+        this._healthCheckInterval = setInterval(async () => {
+            const timeSinceLastChange = Date.now() - this._lastChangeReceivedAt;
+            if (timeSinceLastChange > PeerCouchDB.STALE_THRESHOLD_MS) {
+                this.normalLog(`Health check: no changes received in ${Math.round(timeSinceLastChange / 60000)} minutes, verifying connectivity...`);
+                try {
+                    const info = await this.man.rawGet<Record<string, any>>("" as DocumentID);
+                    if (info) {
+                        this.normalLog(`Health check: CouchDB is reachable`);
+                    } else {
+                        this.normalLog(`Health check: CouchDB returned unexpected response, restarting watcher`, LOG_LEVEL_NOTICE);
+                        this.man.endWatch();
+                        await this._startInner();
+                    }
+                } catch (ex) {
+                    this.normalLog(`Health check: CouchDB unreachable: ${ex}. Restarting watcher.`, LOG_LEVEL_NOTICE);
+                    this.man.endWatch();
+                    await this._startInner();
+                }
+            }
+        }, PeerCouchDB.HEALTH_CHECK_INTERVAL_MS);
     }
     async dispatch(path: string, data: FileData | false) {
         if (data === false) return;
@@ -199,6 +302,18 @@ export class PeerCouchDB extends Peer {
         }
     }
     async stop(): Promise<void> {
+        if (this._sinceSaveInterval) {
+            clearInterval(this._sinceSaveInterval);
+            this._sinceSaveInterval = undefined;
+        }
+        if (this._healthCheckInterval) {
+            clearInterval(this._healthCheckInterval);
+            this._healthCheckInterval = undefined;
+        }
+        // Final save of since pointer
+        if (this.man.since) {
+            this.setSetting("since", this.man.since);
+        }
         this.man.endWatch();
         return await Promise.resolve();
     }
