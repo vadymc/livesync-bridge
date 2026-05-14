@@ -32,18 +32,27 @@ export class Hub {
     }
 
     async dispatch(source: Peer, path: string, data: FileData | false) {
+        // Skip .git and .cocoindex_code internal files — never sync to CouchDB
+        if (path.startsWith('.git/') || path === '.git' || path.includes('/.git/') || path.endsWith('/.git') ||
+            path.startsWith('.cocoindex_code/') || path === '.cocoindex_code' || path.includes('/.cocoindex_code/') || path.endsWith('/.cocoindex_code')) {
+            return;
+        }
         for (const peer of this.peers) {
             if (peer !== source && (source.config.group ?? "") === (peer.config.group ?? "")) {
-                let ret = false;
-                if (data === false) {
-                    ret = await peer.delete(path);
-                } else {
-                    ret = await peer.put(path, data);
-                }
-                if (ret) {
-                    // Logger(`  ${data === false ? "-x->" : "--->"} ${peer.config.name} ${path} `)
-                } else {
-                    // Logger(`        ${peer.config.name} ignored ${path} `)
+                try {
+                    let ret = false;
+                    if (data === false) {
+                        ret = await peer.delete(path);
+                    } else {
+                        ret = await peer.put(path, data);
+                    }
+                    if (ret) {
+                        // Logger(`  ${data === false ? "-x->" : "--->"} ${peer.config.name} ${path} `)
+                    } else {
+                        // Logger(`        ${peer.config.name} ignored ${path} `)
+                    }
+                } catch (ex) {
+                    console.error(`[Hub] Error dispatching to ${peer.config.name} for ${path}:`, ex);
                 }
             }
         }

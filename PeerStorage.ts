@@ -232,6 +232,11 @@ export class PeerStorage extends Peer {
 
     processFile(event: Deno.FsEvent) {
         for (const path of event.paths) {
+            // Skip .git and .cocoindex_code internal files early
+            if (path.includes('/.git/') || path.includes('/.cocoindex_code/') ||
+                path.endsWith('/.git') || path.endsWith('/.cocoindex_code')) {
+                continue;
+            }
             const key = `${event.kind}-${path}`;
             // const key = path;
             scheduleTask(key, 100, async () => {
@@ -260,6 +265,10 @@ export class PeerStorage extends Peer {
             for await (const entry of walk(lP)) {
                 if (entry.isFile) {
                     const ePath = this.toPosixPath(relative(this.toLocalPath("."), entry.path));
+                    // Skip .git and .cocoindex_code internal files
+                    if (ePath.startsWith('.git/') || ePath === '.git' || ePath.startsWith('.cocoindex_code/') || ePath === '.cocoindex_code') {
+                        continue;
+                    }
                     if (await this.isChanged(ePath)) {
                         this.debugLog(`Offline changes detected: ${ePath}`);
                         await this.dispatch(entry.path);
@@ -300,6 +309,9 @@ export class PeerStorage extends Peer {
 
         this.watcher.on("change", async (path) => {
             const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
+            if (ePath.startsWith('.git/') || ePath === '.git' || ePath.startsWith('.cocoindex_code/') || ePath === '.cocoindex_code' || ePath.includes('/.git/') || ePath.includes('/.cocoindex_code/')) {
+                return;
+            }
             if (!await this.isChanged(ePath)) {
                 // this.debugLog(`Not changed: ${ePath}`);
             } else {
@@ -309,6 +321,9 @@ export class PeerStorage extends Peer {
         })
         this.watcher.on("add", async (path) => {
             const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
+            if (ePath.startsWith('.git/') || ePath === '.git' || ePath.startsWith('.cocoindex_code/') || ePath === '.cocoindex_code' || ePath.includes('/.git/') || ePath.includes('/.cocoindex_code/')) {
+                return;
+            }
             if (!await this.isChanged(ePath)) {
                 // this.debugLog(`Not changed: ${ePath}`);
             } else {
@@ -318,6 +333,9 @@ export class PeerStorage extends Peer {
         })
         this.watcher.on("unlink", async (path) => {
             const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
+            if (ePath.startsWith('.git/') || ePath === '.git' || ePath.startsWith('.cocoindex_code/') || ePath === '.cocoindex_code' || ePath.includes('/.git/') || ePath.includes('/.cocoindex_code/')) {
+                return;
+            }
             this.debugLog(`Unlink detected: ${ePath}`);
             await this.dispatchDeleted(path)
         })

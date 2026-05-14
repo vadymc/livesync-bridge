@@ -18,49 +18,61 @@ export class PeerCouchDB extends Peer {
         this.man.since = this.getSetting("since") || "now";
     }
     async delete(pathSrc: string): Promise<boolean> {
-        const path = this.toLocalPath(pathSrc);
-        if (await this.isRepeating(pathSrc, false)) {
+        try {
+            const path = this.toLocalPath(pathSrc);
+            if (await this.isRepeating(pathSrc, false)) {
+                return false;
+            }
+            const r = await this.man.delete(path);
+            if (r) {
+                this.receiveLog(` ${path} deleted`);
+            } else {
+                this.receiveLog(` ${path} delete failed`, LOG_LEVEL_NOTICE);
+            }
+            return r;
+        } catch (ex) {
+            this.normalLog(`DELETE failed for ${pathSrc}: ${ex}`, LOG_LEVEL_NOTICE);
             return false;
         }
-        const r = await this.man.delete(path);
-        if (r) {
-            this.receiveLog(` ${path} deleted`);
-        } else {
-            this.receiveLog(` ${path} delete failed`, LOG_LEVEL_NOTICE);
-        }
-        return r;
     }
     async put(pathSrc: string, data: FileData): Promise<boolean> {
-        const path = this.toLocalPath(pathSrc);
-        if (await this.isRepeating(pathSrc, data)) {
-            return false;
-        }
-        const type = isPlainText(path) ? "plain" : "newnote";
-        const info: FileInfo = {
-            ctime: data.ctime,
-            mtime: data.mtime,
-            size: data.size
-        };
-        const saveData = (data.data instanceof Uint8Array) ? createBinaryBlob(data.data) : createTextBlob(data.data);
-        const old = await this.man.get(path as FilePathWithPrefix, true) as false | MetaEntry;
-        // const old = await this.getMeta(path as FilePathWithPrefix);
-        if (old && Math.abs(this.compareDate(info, old)) < 3600) {
-            const oldDoc = await this.man.getByMeta(old);
-            if (oldDoc && ("data" in oldDoc)) {
-                const d = oldDoc.type == "plain" ? createTextBlob(oldDoc.data) : createBinaryBlob(new Uint8Array(decodeBinary(oldDoc.data)));
-                if (await isDocContentSame(d, saveData)) {
-                    this.normalLog(` Skipped (Same) ${path} `);
-                    return false;
+        try {
+            // Wait for the DirectFileManipulator to be fully initialized
+            await this.man.ready.promise;
+            const path = this.toLocalPath(pathSrc);
+            if (await this.isRepeating(pathSrc, data)) {
+                return false;
+            }
+            const type = isPlainText(path) ? "plain" : "newnote";
+            const info: FileInfo = {
+                ctime: data.ctime,
+                mtime: data.mtime,
+                size: data.size
+            };
+            const saveData = (data.data instanceof Uint8Array) ? createBinaryBlob(data.data) : createTextBlob(data.data);
+            const old = await this.man.get(path as FilePathWithPrefix, true) as false | MetaEntry;
+            // const old = await this.getMeta(path as FilePathWithPrefix);
+            if (old && Math.abs(this.compareDate(info, old)) < 3600) {
+                const oldDoc = await this.man.getByMeta(old);
+                if (oldDoc && ("data" in oldDoc)) {
+                    const d = oldDoc.type == "plain" ? createTextBlob(oldDoc.data) : createBinaryBlob(new Uint8Array(decodeBinary(oldDoc.data)));
+                    if (await isDocContentSame(d, saveData)) {
+                        this.normalLog(` Skipped (Same) ${path} `);
+                        return false;
+                    }
                 }
             }
+            const r = await this.man.put(path, saveData, info, type);
+            if (r) {
+                this.receiveLog(` ${path} saved`);
+            } else {
+                this.receiveLog(` ${path} ignored`);
+            }
+            return r;
+        } catch (ex) {
+            this.normalLog(`PUT failed for ${pathSrc}: ${ex}`, LOG_LEVEL_NOTICE);
+            return false;
         }
-        const r = await this.man.put(path, saveData, info, type);
-        if (r) {
-            this.receiveLog(` ${path} saved`);
-        } else {
-            this.receiveLog(` ${path} ignored`);
-        }
-        return r;
     }
     async get(pathSrc: FilePathWithPrefix): Promise<false | FileData> {
         const path = this.toLocalPath(pathSrc) as FilePathWithPrefix;
@@ -151,6 +163,7 @@ export class PeerCouchDB extends Peer {
             this.normalLog(`Watch starting from ${this.man.since}`);
         }
         this.man.beginWatch(async (entry) => {
+            if (!entry.path) return;
             const d = entry.type == "plain" ? entry.data : new Uint8Array(decodeBinary(entry.data));
             let path = entry.path.substring(baseDir.length);
             if (path.startsWith("/")) {
@@ -166,6 +179,7 @@ export class PeerCouchDB extends Peer {
             }
         }, (entry) => {
             this.setSetting("since", this.man.since);
+            if (!entry.path) return false;
             if (entry.path.indexOf(":") !== -1) return false;
             return entry.path.startsWith(baseDir);
         });
