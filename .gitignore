@@ -4,3 +4,4 @@ vault*/*
 !*.sample.json
 *.log
 node_modules
+_check.ts
